@@ -2,12 +2,18 @@
 import os
 import sys
 import argparse
+import json
 import pyperclip
-from plyer import notification
 
 # ---------------- Config ----------------
 MAX_TOTAL_BYTES = 20 * 1024 * 1024   # 20 MB clipboard guard
 MAX_FILE_BYTES  = 2 * 1024 * 1024    # 2 MB per-file guard
+
+# Behavior is fixed:
+# - Always embed each file path as a language-valid comment inside the file text
+# - Always use absolute (full) paths
+INLINE_PATH_COMMENTS = True
+USE_ABSOLUTE_PATHS = True
 
 # lowercase only
 SKIP_DIRS = {
@@ -31,12 +37,18 @@ SKIP_EXTENSIONS = {
     ".zip", ".tar", ".gz", ".rar", ".7z",
     ".pdf", ".doc", ".docx",
     ".bak",
-    ".map",
+    ".map",      # source maps
+    ".json",     # all JSON (except allowlist below)
     ".log",
     ".tmp",
 }
 
 SKIP_FILENAMES = set()
+
+ALLOW_FILENAMES = {
+    "manifest.json",
+    "packages.json",
+}
 
 
 def _is_minified_name(filename_lower: str) -> bool:
@@ -51,17 +63,15 @@ def should_skip_file(path: str) -> bool:
     filename = os.path.basename(path).lower()
     _, ext = os.path.splitext(filename)
 
+    # allow explicit filenames even if extension is skipped
+    if filename in ALLOW_FILENAMES:
+        return False
+
     if filename in SKIP_FILENAMES:
         return True
     if ext in SKIP_EXTENSIONS:
         return True
     if _is_minified_name(filename):
-        return True
-
-    try:
-        if os.path.getsize(path) > MAX_FILE_BYTES:
-            return True
-    except Exception:
         return True
 
     return False
@@ -76,12 +86,12 @@ def _looks_like_utf16_without_bom(b: bytes) -> str | None:
         return None
 
     even = b[0::2]
-    odd  = b[1::2]
+    odd = b[1::2]
     if not even or not odd:
         return None
 
     even_nul = even.count(b"\x00") / len(even)
-    odd_nul  = odd.count(b"\x00") / len(odd)
+    odd_nul = odd.count(b"\x00") / len(odd)
 
     if odd_nul > 0.60 and even_nul < 0.30:
         return "utf-16-le"
@@ -129,13 +139,35 @@ def detect_file_type(path: str) -> str:
         ".json": "json",
         ".html": "html",
         ".css": "css",
+        ".ini": "Initialization_file",
+        ".csv": "Comma-Separated Values",
         ".py": "python",
+        ".ahk": "autohotkey",
         ".bat": "batch",
         ".ps1": "powershell",
         ".reg": "registry",
         ".txt": "text",
         ".md": "markdown",
     }.get(ext, "text")
+
+
+def comment_prefix_for_type(ft: str) -> tuple[str, str] | None:
+    # returns (prefix, suffix) where suffix can be empty
+    if ft in ("javascript", "typescript", "batch", "powershell", "registry"):
+        return ("// ", "")
+    if ft in ("python", "text", "markdown"):
+        return ("# ", "")
+    if ft == "css":
+        return ("/* ", " */")
+    if ft == "html":
+        return ("<!-- ", " -->")
+    return None
+
+
+def display_path(path: str) -> str:
+    if USE_ABSOLUTE_PATHS:
+        return os.path.abspath(path).replace("\\", "/")
+    return path.replace("\\", "/")
 
 
 def get_file_priority(path: str):
@@ -171,7 +203,7 @@ def get_file_priority(path: str):
         "options.css": 52,
 
         "badge.js": 60,
-        
+
         "readme.md": 800,
         "license": 810,
     }
@@ -206,7 +238,6 @@ def get_all_files_in_folder(folder_path: str, explicitly_requested=False):
     try:
         for root, dirs, files in os.walk(folder_path):
             if not explicitly_requested:
-                # Only filter subdirectories if this wasn't explicitly requested
                 dirs[:] = [d for d in dirs if d.lower() not in SKIP_DIRS]
             for f in files:
                 p = os.path.join(root, f)
@@ -245,22 +276,14 @@ def collect_files(paths):
     return deduped
 
 
-def _looks_like_chrome_extension(file_paths, base_path=None) -> bool:
+def _looks_like_chrome_extension(file_paths) -> bool:
     for p in file_paths:
-        name = os.path.basename(p).lower()
-        if name == "manifest.json":
+        if os.path.basename(p).lower() == "manifest.json":
             return True
-        if base_path:
-            try:
-                rel = os.path.relpath(p, base_path).replace("\\", "/").lower()
-                if rel.endswith("/manifest.json"):
-                    return True
-            except Exception:
-                pass
     return False
 
 
-def generate_analysis_prompt(file_count, file_types, is_extension: bool):
+def generate_analysis_prompt(file_count, file_types, is_extension: bool, output_format: str):
     header = "# Chrome Extension Code Review\n" if is_extension else "# Codebase Review\n"
 
     s = header + "\n"
@@ -289,7 +312,13 @@ def generate_analysis_prompt(file_count, file_types, is_extension: bool):
         s += "- Resource cleanup.\n"
         s += "- Error handling.\n\n"
 
-    s += "---\n\n## Pasted Files (in review order)\n"
+    if output_format == "jsonl":
+        s += "## Format\n"
+        s += "Each subsequent line is a JSON object with fields: path, type, content.\n"
+        s += "Use content as the exact file text (newlines preserved via JSON escapes).\n\n"
+
+    s += "---\n\n## Pasted Files\n"
+    s += "(Each file begins with a FILE: path comment.)\n\n"
     return s
 
 
@@ -331,16 +360,24 @@ def _decode_bytes(raw: bytes) -> str | None:
     return text
 
 
-def read_files_as_text(file_paths, base_path=None):
+def read_files_as_text(file_paths, output_format="markdown", include_prompt=True):
     out = []
+    jsonl_lines = []
     file_types = {}
     total_bytes = 0
     count = 0
     truncated = False
 
-    is_ext = _looks_like_chrome_extension(file_paths, base_path)
+    is_ext = _looks_like_chrome_extension(file_paths)
 
     for p in file_paths:
+        try:
+            st = os.stat(p)
+            if st.st_size > MAX_FILE_BYTES:
+                continue
+        except Exception:
+            continue
+
         try:
             raw = open(p, "rb").read()
         except Exception:
@@ -350,19 +387,38 @@ def read_files_as_text(file_paths, base_path=None):
         if text is None:
             continue
 
-        disp = os.path.relpath(p, base_path) if base_path else p
-        disp = disp.replace("\\", "/")
-
+        disp = display_path(p)
         ft = detect_file_type(p)
         file_types[ft] = file_types.get(ft, 0) + 1
 
-        block = "\n".join([
-            "=" * 80,
-            f"FILE: {disp}",
-            "=" * 80,
-            text,
-            "",
-        ])
+        if INLINE_PATH_COMMENTS:
+            c = comment_prefix_for_type(ft)
+            if c is not None:
+                prefix, suffix = c
+                text = f"{prefix}FILE: {disp}{suffix}\n{text}"
+            else:
+                text = f"# FILE: {disp}\n{text}"
+
+        if output_format == "jsonl":
+            line = json.dumps(
+                {"path": disp, "type": ft, "content": text},
+                ensure_ascii=False,
+            ) + "\n"
+
+            bsz = len(line.encode("utf-8", errors="replace"))
+            if total_bytes + bsz > MAX_TOTAL_BYTES:
+                truncated = True
+                break
+
+            jsonl_lines.append(line)
+            total_bytes += bsz
+            count += 1
+            continue
+
+        block = text
+        if not block.endswith("\n"):
+            block += "\n"
+        block += "\n"
 
         bsz = len(block.encode("utf-8", errors="replace"))
         if total_bytes + bsz > MAX_TOTAL_BYTES:
@@ -373,96 +429,119 @@ def read_files_as_text(file_paths, base_path=None):
         total_bytes += bsz
         count += 1
 
-    prompt = generate_analysis_prompt(count, file_types, is_ext)
-    return prompt + "\n".join(out), count, truncated
+    if output_format == "jsonl":
+        body = "".join(jsonl_lines)
+        if not include_prompt:
+            return body, count, truncated
+        prompt = generate_analysis_prompt(count, file_types, is_ext, output_format)
+        return prompt + "\n" + body, count, truncated
+
+    prompt = generate_analysis_prompt(count, file_types, is_ext, output_format) if include_prompt else ""
+    return prompt + "".join(out), count, truncated
 
 
-def show_notification(title, message):
-    try:
-        notification.notify(
-            title=title,
-            message=message,
-            app_name="copy-clip",
-            timeout=3,
-        )
-    except Exception:
-        pass
-
-
-def _determine_base_path(paths):
-    if len(paths) == 1 and os.path.isdir(paths[0]):
-        return paths[0]
-    try:
-        return os.path.commonpath(paths) if len(paths) > 1 else os.path.dirname(paths[0])
-    except Exception:
-        return None
-
-
-def replace_clipboard(paths):
+def replace_clipboard(paths, output_format="markdown"):
     files = collect_files(paths)
     if not files:
-        show_notification("copy-clip", "No valid files found")
+        print("No valid files found", file=sys.stderr)
         return 1
 
-    base = _determine_base_path(paths)
-    content, count, truncated = read_files_as_text(files, base)
+    content, count, truncated = read_files_as_text(files, output_format=output_format, include_prompt=True)
     if count == 0:
-        show_notification("copy-clip", "No decodable text files found")
+        print("No decodable text files found", file=sys.stderr)
         return 1
 
     pyperclip.copy(content)
-    note = f"Replaced clipboard: {count} files"
+
+    msg = f"Replaced clipboard: {count} files"
     if truncated:
-        note += " (TRUNCATED)"
-    show_notification("copy-clip", note)
+        msg += " (TRUNCATED)"
+    print(msg, file=sys.stderr)
     return 0
 
 
-def append_clipboard(paths):
+def append_clipboard(paths, output_format="markdown"):
     files = collect_files(paths)
     if not files:
-        show_notification("copy-clip", "No valid files found")
-        return 1
-
-    base = _determine_base_path(paths)
-    new_content, count, truncated = read_files_as_text(files, base)
-    if count == 0:
-        show_notification("copy-clip", "No decodable text files found")
+        print("No valid files found", file=sys.stderr)
         return 1
 
     existing = pyperclip.paste()
-    final = (existing + "\n\n" + new_content) if existing else new_content
+
+    # For JSONL appends: if clipboard already has content, append only JSONL lines (no prompt/header).
+    include_prompt = True
+    if output_format == "jsonl" and existing:
+        include_prompt = False
+
+    new_content, count, truncated = read_files_as_text(
+        files,
+        output_format=output_format,
+        include_prompt=include_prompt,
+    )
+
+    if count == 0:
+        print("No decodable text files found", file=sys.stderr)
+        return 1
+
+    if not existing:
+        final = new_content
+    else:
+        sep = "" if existing.endswith("\n") else "\n"
+        final = existing + sep
+        # Markdown appends keep the old behavior: add an extra gap.
+        if output_format != "jsonl":
+            final += "\n"
+        final += new_content
 
     if len(final.encode("utf-8", errors="replace")) > MAX_TOTAL_BYTES:
-        show_notification("copy-clip", "Append blocked: clipboard too large")
+        print("Append blocked: clipboard too large", file=sys.stderr)
         return 1
 
     pyperclip.copy(final)
-    note = f"Appended: {count} files"
+
+    msg = f"Appended: {count} files"
     if truncated:
-        note += " (TRUNCATED)"
-    show_notification("copy-clip", note)
+        msg += " (TRUNCATED)"
+    print(msg, file=sys.stderr)
     return 0
 
 
 def main():
     p = argparse.ArgumentParser(
-        description="Copy project files to clipboard with an LLM review prompt",
+        description=(
+            "Copy project files to clipboard with an LLM review prompt.\n\n"
+            "Commands:\n"
+            "  r   replace clipboard (markdown)\n"
+            "  a   append clipboard (markdown)\n"
+            "  jr  replace clipboard (jsonl)\n"
+            "  j   append clipboard (jsonl)\n"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sp = p.add_subparsers(dest="cmd")
 
-    r = sp.add_parser("r", help="Replace clipboard")
+    r = sp.add_parser("r", help="Replace clipboard (markdown)")
     r.add_argument("paths", nargs="+")
 
-    a = sp.add_parser("a", help="Append clipboard")
+    a = sp.add_parser("a", help="Append clipboard (markdown)")
     a.add_argument("paths", nargs="+")
 
+    jr = sp.add_parser("jr", help="Replace clipboard (jsonl)")
+    jr.add_argument("paths", nargs="+")
+
+    j = sp.add_parser("j", help="Append clipboard (jsonl)")
+    j.add_argument("paths", nargs="+")
+
     args = p.parse_args()
+
     if args.cmd == "r":
-        return replace_clipboard(args.paths)
+        return replace_clipboard(args.paths, output_format="markdown")
     if args.cmd == "a":
-        return append_clipboard(args.paths)
+        return append_clipboard(args.paths, output_format="markdown")
+    if args.cmd == "jr":
+        return replace_clipboard(args.paths, output_format="jsonl")
+    if args.cmd == "j":
+        return append_clipboard(args.paths, output_format="jsonl")
 
     p.print_help()
     return 1
