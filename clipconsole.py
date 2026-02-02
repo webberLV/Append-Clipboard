@@ -1,19 +1,45 @@
 #!/usr/bin/env python3
+# Windows-only. Requires:
+#   pip install pyperclip pywin32
+#
+# Commands (NO FLAGS):
+#   r   replace clipboard (markdown)
+#   a   append clipboard (markdown)
+#   jr  replace clipboard (jsonl)
+#   j   append clipboard (jsonl)
+#
+# Explorer-selection variants (suffix 'e'):
+#   re  ae  jre  je
+#
+# Behavior:
+# - Inventory is BOTH printed to stderr AND embedded into clipboard output at top.
+# - Then applies skip/text/size rules only for what gets copied to clipboard.
+# - Preserves: prompt header generation, JSONL controller behavior (agents.md), include_prompt rules,
+#   file priority ordering, skip rules, encoding detection.
+
 import os
 import sys
 import argparse
 import json
 import pyperclip
 
+import pythoncom  # pywin32
+import win32com.client  # pywin32
+
+if os.name != "nt":
+    print("This script is Windows-only.", file=sys.stderr)
+    sys.exit(1)
+
 # ---------------- Config ----------------
-MAX_TOTAL_BYTES = 20 * 1024 * 1024   # 20 MB clipboard guard
+MAX_TOTAL_BYTES = 20 * 1024 * 1024   # 20 MB clipboard guard (JSONL body + controller + inventory)
 MAX_FILE_BYTES  = 2 * 1024 * 1024    # 2 MB per-file guard
 
-# Behavior is fixed:
-# - Always embed each file path as a language-valid comment inside the file text
-# - Always use absolute (full) paths
 INLINE_PATH_COMMENTS = True
 USE_ABSOLUTE_PATHS = True
+
+# Inventory behavior
+INVENTORY_TO_STDERR = True
+INVENTORY_TO_CLIPBOARD = True
 
 # lowercase only
 SKIP_DIRS = {
@@ -37,7 +63,7 @@ SKIP_EXTENSIONS = {
     ".zip", ".tar", ".gz", ".rar", ".7z",
     ".pdf", ".doc", ".docx",
     ".bak",
-    ".map",      # source maps
+    ".map",
     ".json",     # all JSON (except allowlist below)
     ".log",
     ".tmp",
@@ -47,8 +73,61 @@ SKIP_FILENAMES = set()
 
 ALLOW_FILENAMES = {
     "manifest.json",
-    "packages.json",
+    "package.json",
 }
+
+CONTROLLER_FILENAMES = {
+    "agents.md",
+}
+
+CMD_MAP = {
+    "r":   ("r",  False),
+    "a":   ("a",  False),
+    "jr":  ("jr", False),
+    "j":   ("j",  False),
+    "re":  ("r",  True),
+    "ae":  ("a",  True),
+    "jre": ("jr", True),
+    "je":  ("j",  True),
+}
+
+
+def get_explorer_selected_paths():
+    pythoncom.CoInitialize()
+    try:
+        shell = win32com.client.Dispatch("Shell.Application")
+        wins = shell.Windows()
+
+        out = []
+        for i in range(wins.Count):
+            w = wins.Item(i)
+            try:
+                full = str(getattr(w, "FullName", "")).lower()
+                if not full.endswith("\\explorer.exe"):
+                    continue
+
+                doc = getattr(w, "Document", None)
+                if doc is None:
+                    continue
+
+                items = doc.SelectedItems()
+                if items is None or items.Count <= 0:
+                    continue
+
+                for j in range(items.Count):
+                    it = items.Item(j)
+                    p = str(getattr(it, "Path", "")).strip()
+                    if p:
+                        out.append(p)
+
+                if out:
+                    break
+            except Exception:
+                continue
+
+        return out
+    finally:
+        pythoncom.CoUninitialize()
 
 
 def _is_minified_name(filename_lower: str) -> bool:
@@ -63,7 +142,6 @@ def should_skip_file(path: str) -> bool:
     filename = os.path.basename(path).lower()
     _, ext = os.path.splitext(filename)
 
-    # allow explicit filenames even if extension is skipped
     if filename in ALLOW_FILENAMES:
         return False
 
@@ -152,7 +230,6 @@ def detect_file_type(path: str) -> str:
 
 
 def comment_prefix_for_type(ft: str) -> tuple[str, str] | None:
-    # returns (prefix, suffix) where suffix can be empty
     if ft in ("javascript", "typescript", "batch", "powershell", "registry"):
         return ("// ", "")
     if ft in ("python", "text", "markdown"):
@@ -174,6 +251,8 @@ def get_file_priority(path: str):
     filename = os.path.basename(path).lower()
 
     priority_map = {
+        "agents.md": 0,
+
         "manifest.json": 1,
         "manifest-c.json": 2,
         "manifest-f.json": 3,
@@ -227,53 +306,6 @@ def get_file_priority(path: str):
         ".md": 800,
         ".txt": 900,
     }.get(ext, 999), path)
-
-
-def get_all_files_in_folder(folder_path: str, explicitly_requested=False):
-    """
-    If explicitly_requested=True, ignore SKIP_DIRS and get everything inside.
-    If False, respect SKIP_DIRS during recursive walk.
-    """
-    out = []
-    try:
-        for root, dirs, files in os.walk(folder_path):
-            if not explicitly_requested:
-                dirs[:] = [d for d in dirs if d.lower() not in SKIP_DIRS]
-            for f in files:
-                p = os.path.join(root, f)
-                if should_skip_file(p):
-                    continue
-                if is_probably_text(p):
-                    out.append(p)
-    except Exception as e:
-        print(f"Error reading folder {folder_path}: {e}", file=sys.stderr)
-    return out
-
-
-def collect_files(paths):
-    gathered = []
-    for p in paths:
-        if os.path.isfile(p):
-            if not should_skip_file(p) and is_probably_text(p):
-                gathered.append(p)
-        elif os.path.isdir(p):
-            # User explicitly passed this folder, so include everything inside
-            gathered.extend(get_all_files_in_folder(p, explicitly_requested=True))
-        else:
-            print(f"Path not found: {p}", file=sys.stderr)
-
-    gathered.sort(key=get_file_priority)
-
-    seen = set()
-    deduped = []
-    for p in gathered:
-        rp = os.path.normcase(os.path.abspath(p))
-        if rp in seen:
-            continue
-        seen.add(rp)
-        deduped.append(p)
-
-    return deduped
 
 
 def _looks_like_chrome_extension(file_paths) -> bool:
@@ -360,7 +392,113 @@ def _decode_bytes(raw: bytes) -> str | None:
     return text
 
 
-def read_files_as_text(file_paths, output_format="markdown", include_prompt=True):
+def _inventory_comment_block(inventory_text: str, output_format: str) -> str:
+    """
+    Put inventory inside clipboard in a safe way:
+    - markdown: plain lines
+    - jsonl: comment lines starting with "# " (so it's a controller/header outside JSONL records)
+    """
+    if not inventory_text:
+        return ""
+
+    if output_format == "jsonl":
+        lines = inventory_text.splitlines()
+        return "".join("# " + line + "\n" for line in lines) + "\n"
+
+    # markdown
+    return inventory_text + ("\n" if not inventory_text.endswith("\n") else "") + "\n"
+
+
+def list_all_entries(folder_path: str):
+    all_dirs: list[str] = []
+    all_files: list[str] = []
+    for root, dirs, files in os.walk(folder_path):
+        root_abs = os.path.abspath(root)
+        for d in dirs:
+            all_dirs.append(os.path.abspath(os.path.join(root_abs, d)))
+        for f in files:
+            all_files.append(os.path.abspath(os.path.join(root_abs, f)))
+    return all_dirs, all_files
+
+
+def collect_files_and_inventory(paths):
+    """
+    Returns (filtered_files, inventory_text).
+    Inventory lists everything discovered (dirs+files) with absolute paths.
+    """
+    discovered_files: list[str] = []
+    inv_lines: list[str] = []
+
+    for p in paths:
+        if not os.path.exists(p):
+            msg = f"Path not found: {p}"
+            if INVENTORY_TO_STDERR:
+                print(msg, file=sys.stderr)
+            inv_lines.append(msg)
+            continue
+
+        p_abs = os.path.abspath(p)
+        inv_lines.append(f"== INVENTORY: {p_abs} ==")
+        if INVENTORY_TO_STDERR:
+            print(f"== INVENTORY: {p_abs} ==", file=sys.stderr)
+
+        if os.path.isfile(p_abs):
+            inv_lines.append(f"FILE {p_abs}")
+            if INVENTORY_TO_STDERR:
+                print(f"FILE {p_abs}", file=sys.stderr)
+            discovered_files.append(p_abs)
+            continue
+
+        if os.path.isdir(p_abs):
+            dirs, files = list_all_entries(p_abs)
+
+            for d in sorted(dirs, key=lambda s: s.lower()):
+                inv_lines.append(f"DIR  {d}")
+                if INVENTORY_TO_STDERR:
+                    print(f"DIR  {d}", file=sys.stderr)
+
+            for f in sorted(files, key=lambda s: s.lower()):
+                inv_lines.append(f"FILE {f}")
+                if INVENTORY_TO_STDERR:
+                    print(f"FILE {f}", file=sys.stderr)
+
+            discovered_files.extend(files)
+            continue
+
+        msg = f"Unsupported path: {p}"
+        inv_lines.append(msg)
+        if INVENTORY_TO_STDERR:
+            print(msg, file=sys.stderr)
+
+    # dedupe, then priority sort
+    seen = set()
+    deduped: list[str] = []
+    for p in discovered_files:
+        rp = os.path.normcase(os.path.abspath(p))
+        if rp in seen:
+            continue
+        seen.add(rp)
+        deduped.append(p)
+
+    deduped.sort(key=get_file_priority)
+
+    # filter
+    filtered: list[str] = []
+    for p in deduped:
+        try:
+            if should_skip_file(p):
+                continue
+            if not is_probably_text(p):
+                continue
+            filtered.append(p)
+        except Exception:
+            continue
+
+    inventory_text = "\n".join(inv_lines).rstrip() + "\n"
+    return filtered, inventory_text
+
+
+def read_files_as_text(file_paths, output_format="markdown", include_prompt=True, inventory_text=""):
     out = []
     jsonl_lines = []
     file_types = {}
@@ -370,7 +508,80 @@ def read_files_as_text(file_paths, output_format="markdown", include_prompt=True
 
     is_ext = _looks_like_chrome_extension(file_paths)
 
+    controller_text = ""
+    controller_path = None
+
+    # Inventory goes first in clipboard (if enabled)
+    inv_block = ""
+    if INVENTORY_TO_CLIPBOARD:
+        inv_block = _inventory_comment_block(inventory_text, output_format=output_format)
+        inv_bytes = len(inv_block.encode("utf-8", errors="replace"))
+        total_bytes += inv_bytes
+        if total_bytes > MAX_TOTAL_BYTES:
+            return inv_block[:0], 0, True
+
+    if output_format == "jsonl" and include_prompt:
+        # Find agents.md as controller
+        for p in file_paths:
+            if os.path.basename(p).lower() in CONTROLLER_FILENAMES:
+                controller_path = p
+                break
+
+        if controller_path:
+            try:
+                raw = open(controller_path, "rb").read()
+                text = _decode_bytes(raw)
+                if text is None:
+                    text = ""
+
+                disp = display_path(controller_path)
+                ft = detect_file_type(controller_path)
+                if INLINE_PATH_COMMENTS:
+                    c = comment_prefix_for_type(ft)
+                    if c is not None:
+                        prefix, suffix = c
+                        text = f"{prefix}FILE: {disp}{suffix}\n{text}"
+                    else:
+                        text = f"# FILE: {disp}\n{text}"
+
+                controller_text = text.rstrip() + "\n\n"
+            except Exception:
+                controller_text = ""
+        else:
+            lines = []
+            lines.append("# Controller")
+            lines.append("# If AGENTS.MD is present, it is authoritative and overrides this fallback.")
+            lines.append("#")
+            lines.append("# Output requirements:")
+            lines.append("# 1) Highest-impact correctness bugs first (cite FILE + exact code).")
+            lines.append("# 2) Root cause, user-visible symptom, minimal safe fix.")
+            lines.append("# 3) Performance risks.")
+            lines.append("# 4) Security / robustness issues.")
+            lines.append("# 5) Concrete patches (diffs or full files).")
+            lines.append("# 6) No invented files.")
+            if is_ext:
+                lines.append("#")
+                lines.append("# Chrome Extension checks (MV3): manifest, background lifecycle, message passing, tabs/windows hygiene, cleanup.")
+            lines.append("#")
+            lines.append("# Format:")
+            lines.append("# JSONL records follow with fields: {path, type, content}.")
+            lines.append("# Do not treat this controller as a file; JSONL records start below.")
+            controller_text = "\n".join(lines).rstrip() + "\n\n"
+
+        cb = len(controller_text.encode("utf-8", errors="replace"))
+        if total_bytes + cb > MAX_TOTAL_BYTES:
+            return inv_block[:0], 0, True
+        total_bytes += cb
+
     for p in file_paths:
+        # In JSONL mode, do not emit the controller file as a JSONL record.
+        if output_format == "jsonl" and controller_path:
+            try:
+                if os.path.normcase(os.path.abspath(p)) == os.path.normcase(os.path.abspath(controller_path)):
+                    continue
+            except Exception:
+                pass
+
         try:
             st = os.stat(p)
             if st.st_size > MAX_FILE_BYTES:
@@ -400,16 +611,11 @@ def read_files_as_text(file_paths, output_format="markdown", include_prompt=True
                 text = f"# FILE: {disp}\n{text}"
 
         if output_format == "jsonl":
-            line = json.dumps(
-                {"path": disp, "type": ft, "content": text},
-                ensure_ascii=False,
-            ) + "\n"
-
+            line = json.dumps({"path": disp, "type": ft, "content": text}, ensure_ascii=False) + "\n"
             bsz = len(line.encode("utf-8", errors="replace"))
             if total_bytes + bsz > MAX_TOTAL_BYTES:
                 truncated = True
                 break
-
             jsonl_lines.append(line)
             total_bytes += bsz
             count += 1
@@ -432,23 +638,35 @@ def read_files_as_text(file_paths, output_format="markdown", include_prompt=True
     if output_format == "jsonl":
         body = "".join(jsonl_lines)
         if not include_prompt:
-            return body, count, truncated
-        prompt = generate_analysis_prompt(count, file_types, is_ext, output_format)
-        return prompt + "\n" + body, count, truncated
+            return inv_block + body, count, truncated
+        return inv_block + controller_text + body, count, truncated
 
     prompt = generate_analysis_prompt(count, file_types, is_ext, output_format) if include_prompt else ""
-    return prompt + "".join(out), count, truncated
+    return inv_block + prompt + "".join(out), count, truncated
 
 
 def replace_clipboard(paths, output_format="markdown"):
-    files = collect_files(paths)
+    files, inventory_text = collect_files_and_inventory(paths)
     if not files:
         print("No valid files found", file=sys.stderr)
+        # still allow inventory-only clipboard if asked
+        if INVENTORY_TO_CLIPBOARD and inventory_text:
+            inv_block = _inventory_comment_block(inventory_text, output_format=output_format)
+            pyperclip.copy(inv_block)
         return 1
 
-    content, count, truncated = read_files_as_text(files, output_format=output_format, include_prompt=True)
+    content, count, truncated = read_files_as_text(
+        files,
+        output_format=output_format,
+        include_prompt=True,
+        inventory_text=inventory_text,
+    )
+
     if count == 0:
         print("No decodable text files found", file=sys.stderr)
+        if INVENTORY_TO_CLIPBOARD and inventory_text:
+            inv_block = _inventory_comment_block(inventory_text, output_format=output_format)
+            pyperclip.copy(inv_block)
         return 1
 
     pyperclip.copy(content)
@@ -461,14 +679,18 @@ def replace_clipboard(paths, output_format="markdown"):
 
 
 def append_clipboard(paths, output_format="markdown"):
-    files = collect_files(paths)
+    files, inventory_text = collect_files_and_inventory(paths)
     if not files:
         print("No valid files found", file=sys.stderr)
+        if INVENTORY_TO_CLIPBOARD and inventory_text:
+            inv_block = _inventory_comment_block(inventory_text, output_format=output_format)
+            existing = pyperclip.paste()
+            sep = "" if (not existing or existing.endswith("\n")) else "\n"
+            pyperclip.copy(existing + sep + inv_block)
         return 1
 
     existing = pyperclip.paste()
 
-    # For JSONL appends: if clipboard already has content, append only JSONL lines (no prompt/header).
     include_prompt = True
     if output_format == "jsonl" and existing:
         include_prompt = False
@@ -477,10 +699,15 @@ def append_clipboard(paths, output_format="markdown"):
         files,
         output_format=output_format,
         include_prompt=include_prompt,
+        inventory_text=inventory_text,
     )
 
     if count == 0:
         print("No decodable text files found", file=sys.stderr)
+        if INVENTORY_TO_CLIPBOARD and inventory_text:
+            inv_block = _inventory_comment_block(inventory_text, output_format=output_format)
+            sep = "" if (not existing or existing.endswith("\n")) else "\n"
+            pyperclip.copy(existing + sep + inv_block)
         return 1
 
     if not existing:
@@ -488,7 +715,6 @@ def append_clipboard(paths, output_format="markdown"):
     else:
         sep = "" if existing.endswith("\n") else "\n"
         final = existing + sep
-        # Markdown appends keep the old behavior: add an extra gap.
         if output_format != "jsonl":
             final += "\n"
         final += new_content
@@ -507,43 +733,52 @@ def append_clipboard(paths, output_format="markdown"):
 
 
 def main():
-    p = argparse.ArgumentParser(
+    ap = argparse.ArgumentParser(
         description=(
-            "Copy project files to clipboard with an LLM review prompt.\n\n"
-            "Commands:\n"
+            "Clipboard copier (Windows-only).\n\n"
+            "Commands (no flags):\n"
             "  r   replace clipboard (markdown)\n"
             "  a   append clipboard (markdown)\n"
             "  jr  replace clipboard (jsonl)\n"
-            "  j   append clipboard (jsonl)\n"
+            "  j   append clipboard (jsonl)\n\n"
+            "Explorer-selection variants (suffix 'e'):\n"
+            "  re  ae  jre  je\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    sp = p.add_subparsers(dest="cmd")
+    ap.add_argument("cmd", help="r|a|jr|j|re|ae|jre|je")
+    ap.add_argument("paths", nargs="*")
+    args = ap.parse_args()
 
-    r = sp.add_parser("r", help="Replace clipboard (markdown)")
-    r.add_argument("paths", nargs="+")
+    if args.cmd not in CMD_MAP:
+        print(f"Invalid command: {args.cmd}", file=sys.stderr)
+        return 1
 
-    a = sp.add_parser("a", help="Append clipboard (markdown)")
-    a.add_argument("paths", nargs="+")
+    base_cmd, use_explorer = CMD_MAP[args.cmd]
 
-    jr = sp.add_parser("jr", help="Replace clipboard (jsonl)")
-    jr.add_argument("paths", nargs="+")
+    paths = []
+    if use_explorer:
+        sel = get_explorer_selected_paths()
+        if not sel:
+            print("No Explorer selection found.", file=sys.stderr)
+            return 1
+        paths.extend(sel)
 
-    j = sp.add_parser("j", help="Append clipboard (jsonl)")
-    j.add_argument("paths", nargs="+")
+    paths.extend(args.paths)
 
-    args = p.parse_args()
+    if not paths:
+        print("No input paths.", file=sys.stderr)
+        return 1
 
-    if args.cmd == "r":
-        return replace_clipboard(args.paths, output_format="markdown")
-    if args.cmd == "a":
-        return append_clipboard(args.paths, output_format="markdown")
-    if args.cmd == "jr":
-        return replace_clipboard(args.paths, output_format="jsonl")
-    if args.cmd == "j":
-        return append_clipboard(args.paths, output_format="jsonl")
+    if base_cmd == "r":
+        return replace_clipboard(paths, output_format="markdown")
+    if base_cmd == "a":
+        return append_clipboard(paths, output_format="markdown")
+    if base_cmd == "jr":
+        return replace_clipboard(paths, output_format="jsonl")
+    if base_cmd == "j":
+        return append_clipboard(paths, output_format="jsonl")
 
-    p.print_help()
     return 1
 
 
