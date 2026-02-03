@@ -1,21 +1,58 @@
-# Windows-only. Requires:
-#   pip install pyperclip pywin32
-#
-# Commands (NO FLAGS):
-#   r   replace clipboard (markdown)
-#   a   append clipboard (markdown)
-#   jr  replace clipboard (jsonl)
-#   j   append clipboard (jsonl)
-#
-# Explorer-selection variants (suffix 'e'):
-#   re  ae  jre  je
-#
-# Behavior:
-# - Inventory is BOTH printed to stderr AND embedded into clipboard output at top.
-# - Then applies skip/text/size rules only for what gets copied to clipboard.
-# - Preserves: prompt header generation, JSONL controller behavior (agents.md), include_prompt rules,
-#   file priority ordering, skip rules, encoding detection.
+# Clipboard Code Ingest (Windows-only)
 
+A command-line tool that inventories files/folders, filters and orders decodable text,
+and emits analysis-ready bundles to the clipboard (Markdown or JSONL).
 
+## Requirements
 
-# Troubleshooting: Ensure that python full path is used and full path to the python script downlaoded  (python in a virtual enviroment won't use your windows system and user variables).
+Windows  
+Python 3.x  
+Dependencies:
+  pip install pyperclip pywin32
+
+## Usage
+
+Paths are space-separated.
+Paths containing spaces must be quoted.
+
+Commands (no flags):
+
+  r    Replace clipboard (Markdown)
+  a    Append to clipboard (Markdown)
+  jr   Replace clipboard (JSONL)
+  j    Append to clipboard (JSONL)
+
+Explorer-selection variants (suffix `e`):
+
+  re   ae   jre   je
+
+Explorer variants operate on the current Explorer selection
+instead of explicit path arguments.
+
+## Behavior Guarantees
+
+- Full inventory (all discovered files and directories):
+  - Printed to stderr
+  - Embedded at the top of clipboard output
+- Only clipboard content is subject to:
+  - Skip rules
+  - Text/binary detection
+  - Per-file and total size limits
+- Deterministic file ordering via priority rules
+- Safe encoding detection (UTF-8, UTF-16, Latin-1 fallback)
+- JSONL mode:
+  - Uses `agents.md` as controller if present
+  - Otherwise emits a strict fallback controller
+- No invented files
+- No implicit globbing or recursion beyond explicit paths
+
+## Notes
+
+- This tool is designed for LLM ingestion and code analysis workflows.
+- Output is structured, bounded, and reproducible.
+
+## Troubleshooting
+
+- Invoke with the full Python path if `python` is not on PATH.
+- Ensure the script is executed with the same Python installation
+  where dependencies were installed.
