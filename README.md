@@ -26,6 +26,8 @@ Explorer variants operate on the current Explorer selection
 instead of explicit path arguments.
 
 
+## Bat file
+update the bat file to use your python full path
 
 ## Troubleshooting
 
