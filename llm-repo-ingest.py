@@ -10,12 +10,6 @@
 #
 # Explorer-selection variants (suffix 'e'):
 #   re  ae  jre  je
-#
-# Behavior:
-# - Inventory is BOTH printed to stderr AND embedded into clipboard output at top.
-# - Then applies skip/text/size rules only for what gets copied to clipboard.
-# - Preserves: prompt header generation, JSONL controller behavior (agents.md), include_prompt rules,
-#   file priority ordering, skip rules, encoding detection.
 
 import os
 import sys
@@ -25,35 +19,25 @@ import pyperclip
 
 import pythoncom  # pywin32
 import win32com.client  # pywin32
+import win32gui  # pywin32
 
 if os.name != "nt":
     print("This script is Windows-only.", file=sys.stderr)
     sys.exit(1)
 
 # ---------------- Config ----------------
-MAX_TOTAL_BYTES = 20 * 1024 * 1024   # 20 MB clipboard guard (JSONL body + controller + inventory)
+MAX_TOTAL_BYTES = 20 * 1024 * 1024   # 20 MB clipboard guard
 MAX_FILE_BYTES  = 2 * 1024 * 1024    # 2 MB per-file guard
 
 INLINE_PATH_COMMENTS = True
 USE_ABSOLUTE_PATHS = True
 
-# Inventory behavior
 INVENTORY_TO_STDERR = True
 INVENTORY_TO_CLIPBOARD = True
 
-# lowercase only
 SKIP_DIRS = {
-    "_locales",
-    ".git",
-    "node_modules",
-    "dist",
-    "build",
-    "out",
-    ".next",
-    ".cache",
-    "venv",
-    ".venv",
-    "__pycache__",
+    "_locales", ".git", "node_modules", "dist", "build", "out",
+    ".next", ".cache", "venv", ".venv", "__pycache__",
 }
 
 SKIP_EXTENSIONS = {
@@ -62,11 +46,7 @@ SKIP_EXTENSIONS = {
     ".mp4", ".avi", ".mov", ".wmv", ".mp3", ".wav",
     ".zip", ".tar", ".gz", ".rar", ".7z",
     ".pdf", ".doc", ".docx",
-    ".bak",
-    ".map",
-    ".json",     # all JSON (except allowlist below)
-    ".log",
-    ".tmp",
+    ".bak", ".map", ".log", ".tmp",
 }
 
 SKIP_FILENAMES = set()
@@ -74,6 +54,11 @@ SKIP_FILENAMES = set()
 ALLOW_FILENAMES = {
     "manifest.json",
     "package.json",
+    "requirements.txt",
+    "setup.py",
+    "pyproject.toml",
+    "CMakeLists.txt",
+    "Makefile",
 }
 
 CONTROLLER_FILENAMES = {
@@ -91,14 +76,225 @@ CMD_MAP = {
     "je":  ("j",  True),
 }
 
+# ============================================================
+# OPTION B: GLOBAL vs PLATFORM-SPECIFIC RULES
+# ============================================================
+
+# TRULY GLOBAL - applies to ALL codebases (platform-agnostic)
+GLOBAL_REVIEW_REQUIREMENTS = [
+    "CRITICAL BUGS FIRST - Highest-impact correctness bugs with exact FILE path + line numbers + quoted code snippets. No vague references.",
+    "ROOT CAUSE ANALYSIS - Explain WHY it's broken, what the user experiences, and the underlying architectural flaw.",
+    "PERFORMANCE ISSUES - Identify blocking operations, inefficient algorithms, unnecessary computation, resource exhaustion, memory leaks.",
+    "COMPLETE FILE FIXES REQUIRED - Provide FULL file contents for every modification. No partial snippets. No 'update this section' - give the ENTIRE corrected file. If user intent is unclear or the requested approach is fundamentally flawed, STOP IMMEDIATELY and ask clarifying questions with 2-4 specific options.",
+    "NO HALLUCINATED FILES - Only reference files that exist in the pasted codebase. Do not invent new files unless explicitly requested.",
+    "SECURITY & ROBUSTNESS - Check for: input validation failures, exposed sensitive data, improper permission/access controls, race conditions, unhandled error cases.",
+]
+
+# CHROME EXTENSION ARCHITECTURAL RULES
+EXTENSION_ARCHITECTURAL_RULES = [
+    "ARCHITECTURAL VIOLATIONS - If code structure is fundamentally wrong, provide explicit remediation:",
+    "  1) MISPLACED CODE: Background logic in popup.js, popup logic in service-worker.js, DOM access in background script, state tracking in popup instead of background",
+    "  2) MISSING INFRASTRUCTURE: No chrome.runtime.onMessage handlers, missing message passing between contexts, no TabsInfo state tracking, scattered feature implementation",
+    "  3) COMPONENT RESPONSIBILITIES:",
+    "     - service-worker.js: Background tasks, alarms, persistent state, message routing, tab lifecycle management",
+    "     - popup.js/popup.html: UI rendering only, request data via messages, no business logic, no state persistence",
+    "     - content.js: DOM interaction only, forward events to background, no complex logic",
+    "  4) REMEDIATION STEPS: Identify all misplaced code blocks ? Explain correct responsibilities ? Remove broken scaffolding ? Reimplement in proper location",
+]
+
+# PYTHON ARCHITECTURAL RULES
+PYTHON_ARCHITECTURAL_RULES = [
+    "ARCHITECTURAL VIOLATIONS - If code structure is fundamentally wrong, provide explicit remediation:",
+    "  1) MISPLACED CODE: Business logic in UI code, database access in presentation layer, blocking I/O in async functions",
+    "  2) MISSING INFRASTRUCTURE: No proper module separation, missing __init__.py files, circular imports, global mutable state",
+    "  3) COMPONENT RESPONSIBILITIES:",
+    "     - Core logic: Pure functions, business rules, domain models",
+    "     - I/O layer: Database access, file operations, network calls (async)",
+    "     - Presentation: CLI/GUI code, formatting, user interaction",
+    "  4) REMEDIATION STEPS: Identify coupling violations ? Explain separation of concerns ? Refactor into proper layers",
+]
+
+# CPP ARCHITECTURAL RULES
+CPP_ARCHITECTURAL_RULES = [
+    "ARCHITECTURAL VIOLATIONS - If code structure is fundamentally wrong, provide explicit remediation:",
+    "  1) MISPLACED CODE: Manual memory management where RAII should be used, raw pointers instead of smart pointers, resource cleanup in wrong scope",
+    "  2) MISSING INFRASTRUCTURE: No RAII wrappers, missing move semantics, improper exception safety guarantees",
+    "  3) COMPONENT RESPONSIBILITIES:",
+    "     - Resource owners: Use RAII (unique_ptr, shared_ptr, containers), define rule-of-five if needed",
+    "     - Value types: Proper copy/move semantics, const correctness",
+    "     - Interfaces: Virtual destructors, pure virtual methods, proper inheritance hierarchies",
+    "  4) REMEDIATION STEPS: Identify resource leaks ? Apply RAII patterns ? Implement proper ownership semantics",
+]
+
+# AUTOHOTKEY ARCHITECTURAL RULES
+AUTOHOTKEY_ARCHITECTURAL_RULES = [
+    "ARCHITECTURAL VIOLATIONS - If code structure is fundamentally wrong, provide explicit remediation:",
+    "  1) MISPLACED CODE: Business logic in hotkey handlers, blocking operations without threads, COM cleanup in wrong scope",
+    "  2) MISSING INFRASTRUCTURE: No error handlers for COM calls, missing window existence checks, no timeout handling",
+    "  3) COMPONENT RESPONSIBILITIES:",
+    "     - Hotkeys: Minimal logic, delegate to functions, use labels for complex operations",
+    "     - Functions: Reusable logic, proper scope declarations (global/local), error handling with Try/Catch",
+    "     - GUI: Event-driven handlers, proper cleanup with Gui Destroy, DPI-aware layouts",
+    "  4) REMEDIATION STEPS: Identify scope violations ? Separate concerns ? Add proper error handling",
+]
+
+# JAVASCRIPT ARCHITECTURAL RULES
+JAVASCRIPT_ARCHITECTURAL_RULES = [
+    "ARCHITECTURAL VIOLATIONS - If code structure is fundamentally wrong, provide explicit remediation:",
+    "  1) MISPLACED CODE: Business logic in UI components, data fetching in render functions, state management scattered across files",
+    "  2) MISSING INFRASTRUCTURE: No proper state management, missing error boundaries, unhandled promise rejections",
+    "  3) COMPONENT RESPONSIBILITIES:",
+    "     - Components: Presentation logic only, props-based rendering, no direct API calls",
+    "     - Services: API calls, data transformation, business logic",
+    "     - State: Centralized store (Redux/Context), reducers for updates, selectors for derived data",
+    "  4) REMEDIATION STEPS: Identify coupling ? Extract services ? Implement proper state flow",
+]
+
+# PLATFORM-SPECIFIC CHECKS
+EXTENSION_CHECKS = [
+    "Manifest.json - Verify MV3 compliance, correct permission scopes (activeTab vs tabs, host_permissions), service_worker declaration, content_scripts injection patterns, web_accessible_resources if needed",
+    "Service Worker Lifecycle - Check: proper event registration (not inside async handlers), message listener setup timing, alarm/timer cleanup, storage initialization, self-termination handling, no reliance on global state persistence",
+    "Message Passing Infrastructure - Verify: chrome.runtime.onMessage handlers in all contexts, proper sendMessage/sendResponse patterns, port-based connections for long-lived channels, error handling for disconnected contexts, no missing response acknowledgments",
+    "Tabs API Misuse - Check: improper tab queries (missing windowId filters), stale tab references, missing tab removal listeners, executeScript timing issues, tab state assumptions without verification",
+    "Event Listeners - Verify: proper cleanup on context invalidation, no duplicate registrations, removeListener calls in cleanup functions, alarm/timeout cleanup",
+    "Storage & State - Check: chrome.storage.local consistency, race conditions on concurrent writes, missing error handlers, state synchronization between contexts, migration logic for schema changes",
+    "Web Performance - Identify: unnecessary re-renders, blocking DOM operations, missing debouncing, redundant API calls, unhandled promise rejections",
+    "Web Security - Check: XSS vulnerabilities, unsafe innerHTML usage, CSP violations, postMessage origin validation, missing error boundaries",
+]
+
+PYTHON_CHECKS = [
+    "Type Safety - Check: missing type hints on public functions, inconsistent typing patterns, unhandled None returns, mutable default arguments, incorrect use of Any",
+    "Error Handling - Verify: broad except clauses catching too much, missing context managers for resources (files, locks, connections), unhandled exceptions in async code, missing finally blocks for cleanup",
+    "Performance Issues - Check: unnecessary list comprehensions with side effects, repeated expensive operations in loops, missing caching for pure functions, synchronous I/O in async contexts, inefficient string concatenation",
+    "Memory Leaks - Verify: circular references, unclosed file handles, global state accumulation, dangling references in callbacks, missing __del__ or context manager cleanup",
+    "Async/Await Patterns - Check: missing await keywords, blocking calls in async functions, improper use of asyncio.gather vs asyncio.wait, race conditions in concurrent tasks, missing timeout handling",
+    "Module Structure - Verify: circular imports, missing __init__.py files, improper relative imports, global mutable state, missing if __name__ == '__main__' guards",
+    "Security - Check: SQL injection vulnerabilities, unsafe eval/exec usage, hardcoded credentials, insecure random number generation, path traversal vulnerabilities, missing input sanitization",
+]
+
+AUTOHOTKEY_CHECKS = [
+    "Hotkey Conflicts - Check: duplicate hotkey definitions, conflicting modifier combinations, missing tilde prefix for passthrough, improper use of $ prefix for hook hotkeys",
+    "Variable Scope - Verify: missing global/local declarations, unintended variable shadowing, COM object cleanup, improper use of static variables",
+    "Error Handling - Check: missing Try/Catch blocks around COM calls, unhandled window not found errors, missing timeout handling for WinWait, improper error propagation",
+    "Performance - Verify: missing #NoEnv directive, excessive SetTimer frequency, blocking Sleep calls, redundant DetectHiddenWindows calls, missing A_TickCount optimization",
+    "Window Management - Check: improper WinActivate timing, missing WinWaitActive verification, stale window handles, incorrect window title matching (exact vs contains vs regex)",
+    "GUI Issues - Verify: missing Gui, Destroy on cleanup, memory leaks from unremoved controls, improper event handler registration, missing DPI awareness",
+    "Compatibility - Check: v1 vs v2 syntax mixing, missing #Requires AutoHotkey directive, improper COM object release, missing 64-bit compatibility checks",
+]
+
+CPP_CHECKS = [
+    "Memory Management - Check: missing delete/delete[] for new/new[], memory leaks in exception paths, double free vulnerabilities, use-after-free bugs, missing nullptr checks after allocation",
+    "Resource Management - Verify: RAII pattern usage, missing destructor cleanup, resource leaks (file handles, mutexes, sockets), improper exception safety (basic, strong, nothrow guarantees)",
+    "Undefined Behavior - Check: uninitialized variables, out-of-bounds array access, signed integer overflow, null pointer dereference, dangling pointers/references, violation of strict aliasing",
+    "Concurrency Issues - Verify: data races (missing synchronization), deadlocks (lock ordering), improper mutex usage, missing memory barriers, thread-unsafe static initialization, race conditions in lazy initialization",
+    "Modern C++ Violations - Check: raw pointers instead of smart pointers (unique_ptr, shared_ptr), manual memory management instead of RAII containers, C-style casts instead of static_cast/dynamic_cast, missing const correctness, lack of move semantics",
+    "Performance Issues - Verify: unnecessary copies (missing std::move, pass-by-value for large objects), virtual function calls in tight loops, missing reserve() for vectors, inefficient string concatenation, cache-unfriendly data structures",
+    "API Misuse - Check: buffer overflows in string operations (strcpy, sprintf), incorrect STL container usage, improper iterator invalidation handling, missing exception specifications, incorrect virtual destructor usage in inheritance hierarchies",
+]
+
+JAVASCRIPT_CHECKS = [
+    "Async/Await Disasters - Missing await keywords, unhandled promise rejections, async function calls in sync contexts, Promise.all misuse, race conditions",
+    "Resource Leaks - Unclosed connections, orphaned event listeners, DOM node references, interval/timeout cleanup, memory accumulation in long-lived contexts",
+    "Error Handling - Try/catch coverage, error propagation, user-facing error messages, logging strategy, fallback behaviors",
+    "Data Flow - State management patterns, data mutation tracking, prop drilling issues, unnecessary re-renders, stale closure references",
+    "Type Safety - Missing null/undefined checks, inconsistent type coercion, missing input validation, improper use of any types in TypeScript",
+    "Web Performance - Unnecessary re-renders, blocking DOM operations, missing debouncing/throttling, inefficient selectors, layout thrashing",
+    "Web Security - XSS vulnerabilities, unsafe innerHTML/dangerouslySetInnerHTML, CSRF protection, secure cookie settings, postMessage origin validation",
+]
+
+GENERAL_CHECKS = [
+    "Async/Await Disasters - Missing await keywords, unhandled promise rejections, async function calls in sync contexts, Promise.all misuse, race conditions",
+    "Resource Leaks - Unclosed connections, orphaned event listeners, DOM node references, interval/timeout cleanup, memory accumulation in long-lived contexts",
+    "Error Handling - Try/catch coverage, error propagation, user-facing error messages, logging strategy, fallback behaviors",
+    "Data Flow - State management patterns, data mutation tracking, prop drilling issues, unnecessary re-renders, stale closure references",
+]
+
+# ============================================================
+# NEW: Block system folders for Explorer-derived paths
+# ============================================================
+
+DENY_ROOTS = [
+    os.environ.get("WINDIR", r"C:\Windows"),
+    os.environ.get("ProgramFiles", r"C:\Program Files"),
+    os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+    os.environ.get("ProgramData", r"C:\ProgramData"),
+]
+DENY_DRIVE_ROOTS = True
+
+
+def _norm_path(p: str) -> str:
+    p = (p or "").strip().strip('"')
+    p = os.path.normpath(p)
+    p = os.path.abspath(p)
+    return os.path.normcase(p)
+
+
+def is_denied_explorer_path(p: str) -> bool:
+    if not p:
+        return True
+
+    p = _norm_path(p)
+
+    # Block non-filesystem shell namespaces / weird paths
+    if not os.path.exists(p):
+        return True
+
+    if DENY_DRIVE_ROOTS:
+        drive, tail = os.path.splitdrive(p)
+        if drive and tail in (os.sep, ""):
+            return True
+
+    for root in DENY_ROOTS:
+        if not root:
+            continue
+        r = _norm_path(root)
+        if p == r or p.startswith(r + os.sep):
+            return True
+
+    return False
+
+
+# ============================================================
 
 def get_explorer_selected_paths():
+    """
+    Prefer ACTIVE (foreground) Explorer window.
+    - If selection exists: return selected item paths (filtered against denied roots).
+    - If no selection: return active folder path (filtered against denied roots).
+    Returns [] if not Explorer foreground, or if path(s) are denied.
+    """
     pythoncom.CoInitialize()
     try:
+        fg_hwnd = win32gui.GetForegroundWindow()
+
         shell = win32com.client.Dispatch("Shell.Application")
         wins = shell.Windows()
 
-        out = []
+        def _selected_items(doc):
+            items = doc.SelectedItems()
+            if items is None or items.Count <= 0:
+                return []
+            out = []
+            for j in range(items.Count):
+                it = items.Item(j)
+                p = str(getattr(it, "Path", "")).strip()
+                if p and not is_denied_explorer_path(p):
+                    out.append(p)
+            return out
+
+        def _current_folder(doc):
+            folder = getattr(doc, "Folder", None)
+            if folder is None:
+                return ""
+            self_item = getattr(folder, "Self", None)
+            if self_item is None:
+                return ""
+            p = str(getattr(self_item, "Path", "")).strip()
+            if not p or is_denied_explorer_path(p):
+                return ""
+            return p
+
+        # 1) Foreground Explorer only
         for i in range(wins.Count):
             w = wins.Item(i)
             try:
@@ -106,26 +302,27 @@ def get_explorer_selected_paths():
                 if not full.endswith("\\explorer.exe"):
                     continue
 
+                hwnd = int(getattr(w, "HWND", 0))
+                if hwnd != fg_hwnd:
+                    continue
+
                 doc = getattr(w, "Document", None)
                 if doc is None:
-                    continue
+                    return []
 
-                items = doc.SelectedItems()
-                if items is None or items.Count <= 0:
-                    continue
+                sel = _selected_items(doc)
+                if sel:
+                    return sel
 
-                for j in range(items.Count):
-                    it = items.Item(j)
-                    p = str(getattr(it, "Path", "")).strip()
-                    if p:
-                        out.append(p)
+                folder_path = _current_folder(doc)
+                if folder_path:
+                    return [folder_path]
 
-                if out:
-                    break
+                return []
             except Exception:
                 continue
 
-        return out
+        return []
     finally:
         pythoncom.CoUninitialize()
 
@@ -220,19 +417,28 @@ def detect_file_type(path: str) -> str:
         ".ini": "Initialization_file",
         ".csv": "Comma-Separated Values",
         ".py": "python",
+        ".pyw": "python",
         ".ahk": "autohotkey",
+        ".ahk2": "autohotkey",
         ".bat": "batch",
         ".ps1": "powershell",
         ".reg": "registry",
         ".txt": "text",
         ".md": "markdown",
+        ".cpp": "cpp",
+        ".cc": "cpp",
+        ".cxx": "cpp",
+        ".c": "c",
+        ".h": "cpp_header",
+        ".hpp": "cpp_header",
+        ".hxx": "cpp_header",
     }.get(ext, "text")
 
 
 def comment_prefix_for_type(ft: str) -> tuple[str, str] | None:
-    if ft in ("javascript", "typescript", "batch", "powershell", "registry"):
+    if ft in ("javascript", "typescript", "batch", "powershell", "registry", "cpp", "c", "cpp_header"):
         return ("// ", "")
-    if ft in ("python", "text", "markdown"):
+    if ft in ("python", "text", "markdown", "autohotkey"):
         return ("# ", "")
     if ft == "css":
         return ("/* ", " */")
@@ -252,37 +458,40 @@ def get_file_priority(path: str):
 
     priority_map = {
         "agents.md": 0,
-
         "manifest.json": 1,
         "manifest-c.json": 2,
         "manifest-f.json": 3,
         "package.json": 4,
-
+        "requirements.txt": 5,
+        "setup.py": 6,
+        "pyproject.toml": 7,
+        "cmakelists.txt": 8,
+        "makefile": 9,
         "service-worker.js": 10,
         "background.js": 11,
         "worker.js": 12,
         "messagelistener.js": 13,
         "scriptimport.js": 14,
-
         "helper.js": 20,
         "urlutils.js": 21,
         "tabsinfo.js": 22,
-
         "content.js": 30,
         "content-script.js": 31,
-
         "popup.html": 40,
         "popup.js": 41,
         "popup.css": 42,
         "list.html": 43,
         "list.js": 44,
-
         "options.html": 50,
         "options.js": 51,
         "options.css": 52,
-
         "badge.js": 60,
-
+        "main.py": 100,
+        "__init__.py": 101,
+        "__main__.py": 102,
+        "main.cpp": 110,
+        "main.c": 111,
+        "main.ahk": 120,
         "readme.md": 800,
         "license": 810,
     }
@@ -293,14 +502,24 @@ def get_file_priority(path: str):
     ext = os.path.splitext(filename)[1].lower()
     return ({
         ".json": 200,
+        ".py": 205,
+        ".pyw": 205,
         ".js": 210,
         ".mjs": 210,
         ".cjs": 210,
         ".ts": 215,
         ".tsx": 215,
+        ".cpp": 220,
+        ".cc": 220,
+        ".cxx": 220,
+        ".c": 225,
+        ".h": 230,
+        ".hpp": 230,
+        ".hxx": 230,
+        ".ahk": 240,
+        ".ahk2": 240,
         ".html": 300,
         ".css": 400,
-        ".py": 500,
         ".ps1": 510,
         ".bat": 520,
         ".md": 800,
@@ -315,34 +534,97 @@ def _looks_like_chrome_extension(file_paths) -> bool:
     return False
 
 
-def generate_analysis_prompt(file_count, file_types, is_extension: bool, output_format: str):
-    header = "# Chrome Extension Code Review\n" if is_extension else "# Codebase Review\n"
+def _detect_codebase_type(file_paths) -> str:
+    """Detect what type of codebase this is based on file extensions."""
+    extensions = {}
+    for p in file_paths:
+        ext = os.path.splitext(p)[1].lower()
+        extensions[ext] = extensions.get(ext, 0) + 1
+
+    # Check for Chrome extension
+    if _looks_like_chrome_extension(file_paths):
+        return "chrome_extension"
+
+    # Count file types
+    py_count = extensions.get(".py", 0) + extensions.get(".pyw", 0)
+    cpp_count = extensions.get(".cpp", 0) + extensions.get(".cc", 0) + extensions.get(".cxx", 0) + extensions.get(".c", 0) + extensions.get(".h", 0) + extensions.get(".hpp", 0)
+    ahk_count = extensions.get(".ahk", 0) + extensions.get(".ahk2", 0)
+    js_count = extensions.get(".js", 0) + extensions.get(".ts", 0) + extensions.get(".jsx", 0) + extensions.get(".tsx", 0)
+
+    # Determine primary type (threshold: >30% of files)
+    total = sum(extensions.values())
+    if total == 0:
+        return "general"
+
+    if py_count / total > 0.3:
+        return "python"
+    if cpp_count / total > 0.3:
+        return "cpp"
+    if ahk_count / total > 0.3:
+        return "autohotkey"
+    if js_count / total > 0.3:
+        return "javascript"
+
+    return "general"
+
+
+def generate_analysis_prompt(file_count, file_types, codebase_type: str, output_format: str):
+    """
+    Markdown mode prompt (commands: r, a)
+    Option B: Global requirements + platform-specific architecture + platform-specific checks
+    """
+    type_headers = {
+        "chrome_extension": "# Chrome Extension Code Review\n",
+        "python": "# Python Code Review\n",
+        "cpp": "# C++ Code Review\n",
+        "autohotkey": "# AutoHotkey Script Review\n",
+        "javascript": "# JavaScript/TypeScript Code Review\n",
+        "general": "# Codebase Review\n",
+    }
+
+    header = type_headers.get(codebase_type, "# Codebase Review\n")
 
     s = header + "\n"
     s += "## Input Summary\n"
     s += f"- Total files pasted: {file_count}\n"
     s += "- File type counts: " + ", ".join(f"{k}({v})" for k, v in file_types.items()) + "\n\n"
 
-    s += "## Output Requirements\n"
-    s += "1) Highest-impact correctness bugs first (cite FILE + exact code).\n"
-    s += "2) Root cause, user-visible symptom, minimal safe fix.\n"
-    s += "3) Performance risks.\n"
-    s += "4) Security / robustness issues.\n"
-    s += "5) Concrete patches (diffs or full files).\n"
-    s += "6) No invented files.\n\n"
+    # GLOBAL requirements (apply to all codebases)
+    s += "## Global Requirements\n"
+    for i, req in enumerate(GLOBAL_REVIEW_REQUIREMENTS, 1):
+        s += f"{i}) {req}\n"
+    s += "\n"
 
-    if is_extension:
-        s += "## Chrome Extension Specific Checks\n"
-        s += "- MV3 manifest correctness.\n"
-        s += "- Background lifecycle.\n"
-        s += "- Message passing.\n"
-        s += "- Tabs/windows hygiene.\n"
-        s += "- Cleanup.\n\n"
-    else:
-        s += "## General Codebase Checks\n"
-        s += "- Async sequencing.\n"
-        s += "- Resource cleanup.\n"
-        s += "- Error handling.\n\n"
+    # PLATFORM-SPECIFIC architectural rules
+    architectural_rules = {
+        "chrome_extension": EXTENSION_ARCHITECTURAL_RULES,
+        "python": PYTHON_ARCHITECTURAL_RULES,
+        "cpp": CPP_ARCHITECTURAL_RULES,
+        "autohotkey": AUTOHOTKEY_ARCHITECTURAL_RULES,
+        "javascript": JAVASCRIPT_ARCHITECTURAL_RULES,
+    }
+
+    if codebase_type in architectural_rules:
+        s += "## Architectural Rules\n"
+        for rule in architectural_rules[codebase_type]:
+            s += f"{rule}\n"
+        s += "\n"
+
+    # PLATFORM-SPECIFIC checks
+    platform_checks = {
+        "chrome_extension": ("Chrome Extension Specific Checks", EXTENSION_CHECKS),
+        "python": ("Python Specific Checks", PYTHON_CHECKS),
+        "cpp": ("C++ Specific Checks", CPP_CHECKS),
+        "autohotkey": ("AutoHotkey Specific Checks", AUTOHOTKEY_CHECKS),
+        "javascript": ("JavaScript/TypeScript Specific Checks", JAVASCRIPT_CHECKS),
+        "general": ("General Codebase Checks", GENERAL_CHECKS),
+    }
+
+    check_title, checks = platform_checks.get(codebase_type, ("General Checks", GENERAL_CHECKS))
+    s += f"## {check_title}\n"
+    for check in checks:
+        s += f"- {check}\n"
+    s += "\n"
 
     if output_format == "jsonl":
         s += "## Format\n"
@@ -352,6 +634,61 @@ def generate_analysis_prompt(file_count, file_types, is_extension: bool, output_
     s += "---\n\n## Pasted Files\n"
     s += "(Each file begins with a FILE: path comment.)\n\n"
     return s
+
+
+def generate_jsonl_controller(codebase_type: str):
+    """
+    JSONL mode controller (commands: jr, j) when agents.md is not present.
+    Option B: Global requirements + platform-specific architecture + platform-specific checks
+    """
+    lines = []
+    lines.append("# Controller")
+    lines.append("# If AGENTS.MD is present, it is authoritative and overrides this fallback.")
+    lines.append("#")
+    lines.append("# Global requirements:")
+
+    for i, req in enumerate(GLOBAL_REVIEW_REQUIREMENTS, 1):
+        lines.append(f"# {i}) {req}")
+
+    lines.append("#")
+
+    # PLATFORM-SPECIFIC architectural rules
+    architectural_rules = {
+        "chrome_extension": ("Chrome Extension architectural rules:", EXTENSION_ARCHITECTURAL_RULES),
+        "python": ("Python architectural rules:", PYTHON_ARCHITECTURAL_RULES),
+        "cpp": ("C++ architectural rules:", CPP_ARCHITECTURAL_RULES),
+        "autohotkey": ("AutoHotkey architectural rules:", AUTOHOTKEY_ARCHITECTURAL_RULES),
+        "javascript": ("JavaScript/TypeScript architectural rules:", JAVASCRIPT_ARCHITECTURAL_RULES),
+    }
+
+    if codebase_type in architectural_rules:
+        arch_title, arch_rules = architectural_rules[codebase_type]
+        lines.append(f"# {arch_title}")
+        for rule in arch_rules:
+            lines.append(f"# {rule}")
+        lines.append("#")
+
+    # PLATFORM-SPECIFIC checks
+    platform_checks = {
+        "chrome_extension": ("Chrome Extension checks (MV3):", EXTENSION_CHECKS),
+        "python": ("Python specific checks:", PYTHON_CHECKS),
+        "cpp": ("C++ specific checks:", CPP_CHECKS),
+        "autohotkey": ("AutoHotkey specific checks:", AUTOHOTKEY_CHECKS),
+        "javascript": ("JavaScript/TypeScript specific checks:", JAVASCRIPT_CHECKS),
+        "general": ("General checks:", GENERAL_CHECKS),
+    }
+
+    check_title, checks = platform_checks.get(codebase_type, ("General checks:", GENERAL_CHECKS))
+    lines.append(f"# {check_title}")
+    for check in checks:
+        lines.append(f"# - {check}")
+
+    lines.append("#")
+    lines.append("# Format:")
+    lines.append("# JSONL records follow with fields: {path, type, content}.")
+    lines.append("# Do not treat this controller as a file; JSONL records start below.")
+
+    return "\n".join(lines).rstrip() + "\n\n"
 
 
 def _decode_bytes(raw: bytes) -> str | None:
@@ -396,7 +733,7 @@ def _inventory_comment_block(inventory_text: str, output_format: str) -> str:
     """
     Put inventory inside clipboard in a safe way:
     - markdown: plain lines
-    - jsonl: comment lines starting with "# " (so it's a controller/header outside JSONL records)
+    - jsonl: comment lines starting with "# "
     """
     if not inventory_text:
         return ""
@@ -405,7 +742,6 @@ def _inventory_comment_block(inventory_text: str, output_format: str) -> str:
         lines = inventory_text.splitlines()
         return "".join("# " + line + "\n" for line in lines) + "\n"
 
-    # markdown
     return inventory_text + ("\n" if not inventory_text.endswith("\n") else "") + "\n"
 
 
@@ -506,7 +842,7 @@ def read_files_as_text(file_paths, output_format="markdown", include_prompt=True
     count = 0
     truncated = False
 
-    is_ext = _looks_like_chrome_extension(file_paths)
+    codebase_type = _detect_codebase_type(file_paths)
 
     controller_text = ""
     controller_path = None
@@ -548,25 +884,7 @@ def read_files_as_text(file_paths, output_format="markdown", include_prompt=True
             except Exception:
                 controller_text = ""
         else:
-            lines = []
-            lines.append("# Controller")
-            lines.append("# If AGENTS.MD is present, it is authoritative and overrides this fallback.")
-            lines.append("#")
-            lines.append("# Output requirements:")
-            lines.append("# 1) Highest-impact correctness bugs first (cite FILE + exact code).")
-            lines.append("# 2) Root cause, user-visible symptom, minimal safe fix.")
-            lines.append("# 3) Performance risks.")
-            lines.append("# 4) Security / robustness issues.")
-            lines.append("# 5) Concrete patches (diffs or full files).")
-            lines.append("# 6) No invented files.")
-            if is_ext:
-                lines.append("#")
-                lines.append("# Chrome Extension checks (MV3): manifest, background lifecycle, message passing, tabs/windows hygiene, cleanup.")
-            lines.append("#")
-            lines.append("# Format:")
-            lines.append("# JSONL records follow with fields: {path, type, content}.")
-            lines.append("# Do not treat this controller as a file; JSONL records start below.")
-            controller_text = "\n".join(lines).rstrip() + "\n\n"
+            controller_text = generate_jsonl_controller(codebase_type)
 
         cb = len(controller_text.encode("utf-8", errors="replace"))
         if total_bytes + cb > MAX_TOTAL_BYTES:
@@ -641,7 +959,7 @@ def read_files_as_text(file_paths, output_format="markdown", include_prompt=True
             return inv_block + body, count, truncated
         return inv_block + controller_text + body, count, truncated
 
-    prompt = generate_analysis_prompt(count, file_types, is_ext, output_format) if include_prompt else ""
+    prompt = generate_analysis_prompt(count, file_types, codebase_type, output_format) if include_prompt else ""
     return inv_block + prompt + "".join(out), count, truncated
 
 
@@ -649,7 +967,6 @@ def replace_clipboard(paths, output_format="markdown"):
     files, inventory_text = collect_files_and_inventory(paths)
     if not files:
         print("No valid files found", file=sys.stderr)
-        # still allow inventory-only clipboard if asked
         if INVENTORY_TO_CLIPBOARD and inventory_text:
             inv_block = _inventory_comment_block(inventory_text, output_format=output_format)
             pyperclip.copy(inv_block)
@@ -760,7 +1077,7 @@ def main():
     if use_explorer:
         sel = get_explorer_selected_paths()
         if not sel:
-            print("No Explorer selection found.", file=sys.stderr)
+            print("No Explorer selection/folder found (or blocked system folder).", file=sys.stderr)
             return 1
         paths.extend(sel)
 
